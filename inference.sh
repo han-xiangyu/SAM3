@@ -1,14 +1,19 @@
 #!/bin/bash
 
+input_dir=/media/xiangyu/Ultra/2025-12-02_m20240018s2_ga-atlanta/processed_outputs_global/colmap_output_start1000_keyframes5000_all_cams
+
 
 python scripts/batch_segment_images.py \
-    --input-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/images \
-    --prompt "cars" \
-    --prompt "bags" \
+    --input-dir $input_dir/images \
+    --prompt "vehicles" \
     --prompt "vehicles shadows" \
     --prompt "pedestrians" \
-    --output-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/dynamic_masks \
-    --overlay-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/dynamic_overlays \
+    --prompt "bicycles" \
+    --prompt "motorcycles" \
+    --prompt "trucks" \
+    --prompt "people" \
+    --output-dir $input_dir/dynamic_masks \
+    --overlay-dir $input_dir/dynamic_overlays \
     --combine-prompts \
     --device cuda \
     --confidence 0.4
@@ -16,20 +21,20 @@ python scripts/batch_segment_images.py \
 
 
 python scripts/batch_segment_images.py \
-    --input-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/images \
+    --input-dir $input_dir/images \
     --prompt "sky" \
-    --output-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/sky_masks \
-    --overlay-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/sky_overlays \
+    --output-dir $input_dir/sky_masks \
+    --overlay-dir $input_dir/sky_overlays \
     --combine-prompts \
     --device cuda \
     --confidence 0.4
 
 
 python scripts/batch_segment_images.py \
-    --input-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/images \
+    --input-dir $input_dir/images \
     --prompt "road" \
-    --output-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/road_masks \
-    --overlay-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/road_overlays \
+    --output-dir $input_dir/ground_masks \
+    --overlay-dir $input_dir/ground_overlays \
     --combine-prompts \
     --device cuda \
     --confidence 0.4

@@ -3,23 +3,20 @@
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import List, Sequence
 
 import torch
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw
 
+# Assuming these imports exist in your environment
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
 IMAGE_EXTENSIONS: Sequence[str] = (
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".webp",
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
 )
 
 
@@ -30,36 +27,64 @@ def find_images(root: Path) -> List[Path]:
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     ]
 
-
 def save_instance_mask(masks: torch.Tensor, scores: torch.Tensor, output_path: Path):
-    """Persist all instance masks into a single label image.
-
-    Instances are encoded as integer IDs (1..N) with highest-score masks taking precedence on overlaps.
-    Saved as 16-bit PNG to allow many instances.
-    """
-    # masks: [N, 1, H, W] bool
+    """Persist masks into a single binary image (White=Mask, Black=Background)."""
+    # masks: [N, 1, H, W]
     if masks.ndim != 4:
         raise ValueError(f"Expected masks with shape [N,1,H,W], got {masks.shape}")
-    num_instances, _, height, width = masks.shape
-    device = masks.device
-    id_map = torch.zeros((height, width), dtype=torch.int32, device=device)
+    
+    # 1. Collapse all N instances into a single boolean mask
+    # If ANY instance covers a pixel, that pixel becomes True.
+    merged_mask = torch.any(masks, dim=0).squeeze(0)  # Shape: [H, W] (boolean)
 
-    # Apply higher-score masks first so they win on overlaps
-    order = torch.argsort(scores.to(device), descending=True)
-    for rank, idx in enumerate(order, start=1):
-        mask = masks[int(idx)].squeeze(0)
-        id_map = torch.where(
-            mask, torch.tensor(rank, dtype=id_map.dtype, device=device), id_map
-        )
+    # 2. Convert to standard 8-bit grayscale integer (0 or 255)
+    # True becomes 255 (White), False becomes 0 (Black)
+    mask_uint8 = (merged_mask.cpu().numpy().astype(np.uint8) * 255)
 
-    mask_img = Image.fromarray(id_map.cpu().numpy().astype("uint16"), mode="I;16")
+    # 3. Save as standard 'L' (Grayscale) PNG
+    mask_img = Image.fromarray(mask_uint8, mode="L")
     mask_img.save(output_path)
 
 
+def save_overlay(image: Image.Image, masks: torch.Tensor, output_path: Path):
+    """Save a visualization of the masks overlaid on the image."""
+    # Convert PIL image to RGBA for alpha blending
+    overlay_img = image.convert("RGBA")
+    
+    # Generate random colors for each mask
+    num_masks = masks.shape[0]
+    
+    # Create a transparent layer to draw masks onto
+    mask_layer = Image.new("RGBA", overlay_img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(mask_layer)
+    
+    for i in range(num_masks):
+        # random color with 50% opacity (128)
+        color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), 128)
+        
+        # masks[i] is [1, H, W], squeeze to [H, W]
+        m = masks[i].squeeze().cpu().numpy()
+        
+        # Create a bitmap from the boolean mask
+        # We can draw the bitmap or convert to polygon. 
+        # Fast way for PIL: Create an image from the mask and color it.
+        
+        # Create a solid color image
+        solid_color = Image.new("RGBA", overlay_img.size, color)
+        # Create the mask as a L (grayscale) image
+        mask_pil = Image.fromarray((m * 255).astype(np.uint8), mode='L')
+        
+        # Paste the solid color using the mask
+        mask_layer.paste(solid_color, (0, 0), mask_pil)
+
+    # Alpha composite the original image and the mask layer
+    final = Image.alpha_composite(overlay_img, mask_layer)
+    final.convert("RGB").save(output_path)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Segment a folder of images with SAM3."
-    )
+    parser = argparse.ArgumentParser(description="Segment a folder of images with SAM3.")
+    
     parser.add_argument(
         "--input-dir",
         type=Path,
@@ -72,12 +97,30 @@ def parse_args() -> argparse.Namespace:
         default=Path("sam3_batch_output"),
         help="Folder to write masks and summary JSON.",
     )
+    
+    # CHANGED: action='append' allows multiple --prompt flags
     parser.add_argument(
         "--prompt",
-        type=str,
+        action="append",
         required=True,
-        help="Text prompt describing the concept to segment.",
+        help="Text prompt(s). Can use multiple --prompt flags.",
     )
+    
+    # ADDED: Overlay directory
+    parser.add_argument(
+        "--overlay-dir",
+        type=Path,
+        default=None,
+        help="Folder to write visualization overlays.",
+    )
+    
+    # ADDED: Combine prompts flag
+    parser.add_argument(
+        "--combine-prompts",
+        action="store_true",
+        help="If set, combines detections from all prompts into one file per image.",
+    )
+
     parser.add_argument(
         "--device",
         type=str,
@@ -96,6 +139,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    
     if not args.input_dir.is_dir():
         raise SystemExit(f"Input directory not found: {args.input_dir}")
 
@@ -103,44 +147,82 @@ def main() -> None:
     if not images:
         raise SystemExit(f"No images found under {args.input_dir}")
 
+    # Ensure output directories exist
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Loading SAM3 on {args.device} (prompt='{args.prompt}')...")
+    if args.overlay_dir:
+        args.overlay_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading SAM3 on {args.device}...")
+    print(f"Prompts: {args.prompt}")
+    
     model = build_sam3_image_model(device=args.device)
     processor = Sam3Processor(
         model, device=args.device, confidence_threshold=args.confidence
     )
 
     summary = []
+    
     for img_path in sorted(images):
         with Image.open(img_path) as im:
             image = im.convert("RGB")
 
-        state = processor.set_image(image, state={})
-        state = processor.set_text_prompt(prompt=args.prompt, state=state)
+        # Initialize storage for this image
+        final_masks_list = []
+        final_scores_list = []
+        final_boxes_list = []
 
-        masks = state["masks"]
-        boxes = state["boxes"]
-        scores = state["scores"]
+        # Iterate over all provided prompts (e.g., "cars", "bags")
+        for p in args.prompt:
+            # We reset state or pass fresh state if we want independent detections per prompt
+            # Usually for SAM-style models, separate prompts mean separate queries.
+            state = processor.set_image(image, state={})
+            state = processor.set_text_prompt(prompt=p, state=state)
 
-        if masks.numel() == 0:
-            print(f"[skip] {img_path.name}: no detections above threshold")
+            m = state["masks"]  # [N, 1, H, W]
+            b = state["boxes"]
+            s = state["scores"]
+            
+            # Filter low confidence locally if model doesn't do it strictly enough, 
+            # though processor usually handles it via init threshold.
+            if m.numel() > 0:
+                final_masks_list.append(m)
+                final_scores_list.append(s)
+                final_boxes_list.append(b)
+
+        # If we found nothing for ANY prompt
+        if not final_masks_list:
+            print(f"[skip] {img_path.name}: no detections for {args.prompt}")
             continue
 
-        mask_filename = f"{img_path.stem}_instances.png"
-        mask_path = args.output_dir / mask_filename
-        save_instance_mask(masks, scores, mask_path)
+        # Concatenate results from all prompts
+        final_masks = torch.cat(final_masks_list, dim=0)
+        final_scores = torch.cat(final_scores_list, dim=0)
+        final_boxes = torch.cat(final_boxes_list, dim=0)
 
+        # 1. Save Mask
+        mask_filename = f"{img_path.stem}.png"
+        mask_path = args.output_dir / mask_filename
+        save_instance_mask(final_masks, final_scores, mask_path)
+
+        # 2. Save Overlay (if requested)
+        if args.overlay_dir:
+            overlay_filename = f"{img_path.stem}.jpg"
+            overlay_path = args.overlay_dir / overlay_filename
+            save_overlay(image, final_masks, overlay_path)
+
+        # 3. Update Summary
         summary.append(
             {
                 "source_image": str(img_path),
                 "mask": mask_filename,
-                "instances": len(masks),
-                "scores": [float(s.cpu()) for s in scores],
-                "boxes_xyxy": [[float(x) for x in b.cpu()] for b in boxes],
+                "instances": len(final_masks),
+                "scores": [float(s.cpu()) for s in final_scores],
+                # Boxes might need flattening depending on shape
+                "boxes_xyxy": [[float(x) for x in b.cpu()] for b in final_boxes],
             }
         )
 
-        print(f"[done] {img_path.name}: wrote {len(masks)} instances into {mask_filename}")
+        print(f"[done] {img_path.name}: wrote {len(final_masks)} instances (Prompts: {args.prompt})")
 
     summary_path = args.output_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
@@ -150,13 +232,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-#   python scripts/batch_segment_images.py \
-#     --prompt "car shadow" \
-#     --output-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/sam3_masks \
-#     --overlay-dir /home/xiangyu/Downloads/MCM_logs/sam3_test/sam3_overlays \
-#     --combine-prompts \
-#     --device cuda \
-#     --confidence 0.4
