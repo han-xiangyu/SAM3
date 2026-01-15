@@ -242,7 +242,7 @@ def main() -> None:
             save_overlay(image, final_masks, overlay_path)
 
         # 3. Update Summary
-        if args.save_summary:
+        if args.write_summary:
             summary.append(
                 {
                     "source_image": str(img_path),
