@@ -13,11 +13,11 @@ python scripts/batch_segment_images.py \
     --prompt "trucks" \
     --prompt "people" \
     --output-dir $input_dir/dynamic_masks \
-    --overlay-dir $input_dir/dynamic_overlays \
     --combine-prompts \
     --device cuda \
     --write-empty \
     --confidence 0.4
+    # --overlay-dir $input_dir/dynamic_overlays \
 
 
 
@@ -25,19 +25,18 @@ python scripts/batch_segment_images.py \
     --input-dir $input_dir/images \
     --prompt "sky" \
     --output-dir $input_dir/sky_masks \
-    --overlay-dir $input_dir/sky_overlays \
     --combine-prompts \
     --device cuda \
     --write-empty \
     --confidence 0.4
-
+    # --overlay-dir $input_dir/sky_overlays \
 
 python scripts/batch_segment_images.py \
     --input-dir $input_dir/images \
     --prompt "road" \
     --output-dir $input_dir/ground_masks \
-    --overlay-dir $input_dir/ground_overlays \
     --combine-prompts \
     --device cuda \
     --write-empty \
     --confidence 0.4
+    # --overlay-dir $input_dir/ground_overlays \
