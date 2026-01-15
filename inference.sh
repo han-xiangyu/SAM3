@@ -16,6 +16,7 @@ python scripts/batch_segment_images.py \
     --overlay-dir $input_dir/dynamic_overlays \
     --combine-prompts \
     --device cuda \
+    --write-empty \
     --confidence 0.4
 
 
@@ -27,6 +28,7 @@ python scripts/batch_segment_images.py \
     --overlay-dir $input_dir/sky_overlays \
     --combine-prompts \
     --device cuda \
+    --write-empty \
     --confidence 0.4
 
 
@@ -37,4 +39,5 @@ python scripts/batch_segment_images.py \
     --overlay-dir $input_dir/ground_overlays \
     --combine-prompts \
     --device cuda \
+    --write-empty \
     --confidence 0.4
