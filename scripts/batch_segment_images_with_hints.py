@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""Batch run SAM3 image segmentation over a folder of images.
+Modified: write an empty mask when no objects are detected.
+"""
+
+import argparse
+import json
+import random
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image, ImageDraw
+
+# Assuming these imports exist in your environment
+from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+IMAGE_EXTENSIONS: Sequence[str] = (
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
+)
+
+
+def find_images(root: Path) -> List[Path]:
+    return [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
+def save_instance_mask(masks: torch.Tensor, scores: torch.Tensor, output_path: Path):
+    """Persist masks into a single binary image (White=Mask, Black=Background)."""
+    # masks: [N, 1, H, W]
+    if masks.ndim != 4:
+        raise ValueError(f"Expected masks with shape [N,1,H,W], got {masks.shape}")
+
+    # 1. Collapse all N instances into a single boolean mask
+    merged_mask = torch.any(masks, dim=0).squeeze(0)  # [H, W] boolean
+
+    # 2. Convert to 8-bit grayscale (0 or 255)
+    mask_uint8 = (merged_mask.cpu().numpy().astype(np.uint8) * 255)
+
+    # 3. Save as 'L' PNG
+    mask_img = Image.fromarray(mask_uint8, mode="L")
+    mask_img.save(output_path)
+
+
+def save_empty_mask_like_image(image: Image.Image, output_path: Path):
+    """Save an all-zero (black) single-channel mask with same resolution as the input image."""
+    w, h = image.size
+    empty = np.zeros((h, w), dtype=np.uint8)  # [H, W], all zeros
+    Image.fromarray(empty, mode="L").save(output_path)
+
+
+def save_overlay(image: Image.Image, masks: torch.Tensor, output_path: Path):
+    """Save a visualization of the masks overlaid on the image."""
+    overlay_img = image.convert("RGBA")
+
+    num_masks = masks.shape[0]
+
+    mask_layer = Image.new("RGBA", overlay_img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(mask_layer)
+
+    for i in range(num_masks):
+        color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), 128)
+
+        m = masks[i].squeeze().cpu().numpy()  # [H, W]
+
+        solid_color = Image.new("RGBA", overlay_img.size, color)
+        mask_pil = Image.fromarray((m * 255).astype(np.uint8), mode="L")
+
+        mask_layer.paste(solid_color, (0, 0), mask_pil)
+
+    final = Image.alpha_composite(overlay_img, mask_layer)
+    final.convert("RGB").save(output_path)
+
+
+def load_hint_centers(path: Path) -> Dict[str, List[Tuple[float, float]]]:
+    """Load JSONL hint centers keyed by image name."""
+    hints: Dict[str, List[Tuple[float, float]]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_num} of {path}") from exc
+
+            image_name = str(record.get("image", "")).strip()
+            centers = record.get("centers", [])
+            if not image_name:
+                raise ValueError(f"Missing image name on line {line_num} of {path}")
+            if not isinstance(centers, list):
+                raise ValueError(f"Invalid centers on line {line_num} of {path}")
+
+            parsed_centers: List[Tuple[float, float]] = []
+            for center in centers:
+                if not isinstance(center, (list, tuple)) or len(center) != 2:
+                    raise ValueError(f"Invalid center entry on line {line_num} of {path}")
+                parsed_centers.append((float(center[0]), float(center[1])))
+
+            hints[image_name] = parsed_centers
+    return hints
+
+
+def mask_centroids_xy(masks: torch.Tensor) -> np.ndarray:
+    """Compute per-mask centroids as (x, y) coordinates."""
+    if masks.ndim != 4:
+        raise ValueError(f"Expected masks with shape [N,1,H,W], got {masks.shape}")
+
+    centers = []
+    for idx in range(masks.shape[0]):
+        mask = masks[idx].squeeze().cpu().numpy()
+        coords = np.argwhere(mask > 0)
+        if coords.size == 0:
+            centers.append((np.nan, np.nan))
+            continue
+        y_mean, x_mean = coords.mean(axis=0)
+        centers.append((float(x_mean), float(y_mean)))
+    return np.array(centers, dtype=np.float32)
+
+
+def select_masks_by_hints(
+    masks: torch.Tensor,
+    scores: torch.Tensor,
+    boxes: torch.Tensor,
+    hint_points: List[Tuple[float, float]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select masks by closest hint points, allowing duplicate selections."""
+    if not hint_points:
+        empty = masks[:0]
+        return empty, scores[:0], boxes[:0]
+
+    centers = mask_centroids_xy(masks)
+    if centers.size == 0:
+        empty = masks[:0]
+        return empty, scores[:0], boxes[:0]
+
+    hints_arr = np.array(hint_points, dtype=np.float32)
+    distances = (
+        (hints_arr[:, None, 0] - centers[None, :, 0]) ** 2
+        + (hints_arr[:, None, 1] - centers[None, :, 1]) ** 2
+    )
+    distances = np.where(np.isnan(distances), np.inf, distances)
+    nearest = np.argmin(distances, axis=1).tolist()
+
+    idx = torch.tensor(nearest, dtype=torch.long, device=masks.device)
+    return masks.index_select(0, idx), scores.index_select(0, idx), boxes.index_select(0, idx)
+
+
+def merge_adjacent_masks(
+    masks: torch.Tensor,
+    scores: torch.Tensor,
+    boxes: torch.Tensor,
+    gap_px: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Merge masks that are within a pixel gap of each other."""
+    if masks.ndim != 4:
+        raise ValueError(f"Expected masks with shape [N,1,H,W], got {masks.shape}")
+    if masks.shape[0] <= 1:
+        return masks, scores, boxes
+
+    masks_bool = masks.squeeze(1).bool()
+    padding = int(max(gap_px, 0))
+    kernel = 2 * padding + 1
+    if kernel > 1:
+        dilated = F.max_pool2d(
+            masks_bool.float().unsqueeze(1),
+            kernel_size=kernel,
+            stride=1,
+            padding=padding,
+        ).squeeze(1).bool()
+    else:
+        dilated = masks_bool
+
+    num_masks = masks_bool.shape[0]
+    parent = list(range(num_masks))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(num_masks):
+        for j in range(i + 1, num_masks):
+            if (dilated[i] & masks_bool[j]).any():
+                union(i, j)
+
+    groups: Dict[int, List[int]] = {}
+    for idx in range(num_masks):
+        root = find(idx)
+        groups.setdefault(root, []).append(idx)
+
+    merged_masks = []
+    merged_scores = []
+    merged_boxes = []
+
+    for indices in groups.values():
+        group_mask = masks_bool[indices].any(dim=0)
+        merged_masks.append(group_mask)
+        merged_scores.append(scores[indices].max())
+
+        coords = torch.nonzero(group_mask, as_tuple=False)
+        if coords.numel() == 0:
+            merged_boxes.append(torch.tensor([0, 0, 0, 0], device=masks.device))
+        else:
+            y_min = coords[:, 0].min()
+            x_min = coords[:, 1].min()
+            y_max = coords[:, 0].max()
+            x_max = coords[:, 1].max()
+            merged_boxes.append(
+                torch.stack([x_min, y_min, x_max, y_max]).to(masks.device)
+            )
+
+    merged_masks_t = torch.stack(merged_masks, dim=0).unsqueeze(1).to(masks.device)
+    merged_scores_t = torch.stack(merged_scores, dim=0).to(masks.device)
+    merged_boxes_t = torch.stack(merged_boxes, dim=0).to(masks.device)
+    return merged_masks_t, merged_scores_t, merged_boxes_t
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Segment a folder of images with SAM3.")
+
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        required=True,
+        help="Folder containing images to process (recurses).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("sam3_batch_output"),
+        help="Folder to write masks and summary JSON.",
+    )
+
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        required=True,
+        help="Text prompt(s). Can use multiple --prompt flags.",
+    )
+
+    parser.add_argument(
+        "--overlay-dir",
+        type=Path,
+        default=None,
+        help="Folder to write visualization overlays.",
+    )
+
+    parser.add_argument(
+        "--combine-prompts",
+        action="store_true",
+        help="If set, combines detections from all prompts into one file per image.",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        choices=["cuda", "cpu"],
+        help="Device for inference.",
+    )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.5,
+        help="Confidence threshold for filtering detections.",
+    )
+
+    parser.add_argument(
+        "--write-empty",
+        action="store_true",
+        default=True,
+        help="If set, writes an empty mask when no detections are found (default: True).",
+    )
+    parser.add_argument(
+        "--no-write-empty",
+        dest="write_empty",
+        action="store_false",
+        help="Disable writing empty masks when no detections are found.",
+    )
+
+    parser.add_argument(
+        "--write-summary",
+        action="store_true",
+        default=False,
+        help="If set, writes a summary JSON file with detection details.",
+    )
+    parser.add_argument(
+        "--hint-centers-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "JSONL file with per-image hint centers. Each line: "
+            '{"image": "<name>", "centers": [[cx, cy], ...]}'
+        ),
+    )
+    parser.add_argument(
+        "--merge-gap-px",
+        type=int,
+        default=10,
+        help="Pixel gap tolerance to merge adjacent masks before hint matching.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if not args.input_dir.is_dir():
+        raise SystemExit(f"Input directory not found: {args.input_dir}")
+
+    images = find_images(args.input_dir)
+    if not images:
+        raise SystemExit(f"No images found under {args.input_dir}")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.overlay_dir:
+        args.overlay_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading SAM3 on {args.device}...")
+    print(f"Prompts: {args.prompt}")
+
+    model = build_sam3_image_model(device=args.device)
+    processor = Sam3Processor(
+        model, device=args.device, confidence_threshold=args.confidence
+    )
+
+    hint_centers: Dict[str, List[Tuple[float, float]]] = {}
+    if args.hint_centers_jsonl is not None:
+        if not args.hint_centers_jsonl.is_file():
+            raise SystemExit(f"Hint centers file not found: {args.hint_centers_jsonl}")
+        hint_centers = load_hint_centers(args.hint_centers_jsonl)
+
+    summary = []
+
+    for img_path in sorted(images):
+        with Image.open(img_path) as im:
+            image = im.convert("RGB")
+
+        final_masks_list = []
+        final_scores_list = []
+        final_boxes_list = []
+
+        for p in args.prompt:
+            state = processor.set_image(image, state={})
+            state = processor.set_text_prompt(prompt=p, state=state)
+
+            m = state["masks"]   # [N, 1, H, W]
+            b = state["boxes"]
+            s = state["scores"]
+
+            # Only append if there is at least one instance
+            if m is not None and m.numel() > 0 and m.shape[0] > 0:
+                final_masks_list.append(m)
+                final_scores_list.append(s)
+                final_boxes_list.append(b)
+
+        mask_filename = f"{img_path.stem}.png"
+        mask_path = args.output_dir / mask_filename
+
+        # If we found nothing for ANY prompt -> write empty mask (instead of skipping)
+        if not final_masks_list:
+            print(f"[empty] {img_path.name}: no detections for {args.prompt} -> writing empty mask")
+
+            if args.write_empty:
+                save_empty_mask_like_image(image, mask_path)
+
+                # Optional overlay: just save the original image (no masks) for consistency
+                if args.overlay_dir:
+                    overlay_filename = f"{img_path.stem}.jpg"
+                    overlay_path = args.overlay_dir / overlay_filename
+                    image.save(overlay_path)
+
+                if args.write_summary:
+                    summary.append(
+                        {
+                            "source_image": str(img_path),
+                            "mask": mask_filename,
+                            "instances": 0,
+                            "scores": [],
+                            "boxes_xyxy": [],
+                            "empty": True,
+                        }
+                    )
+            else:
+                print(f"[skip] {img_path.name}: no detections (empty mask writing disabled)")
+            continue
+
+        # Concatenate results from all prompts
+        final_masks = torch.cat(final_masks_list, dim=0)
+        final_scores = torch.cat(final_scores_list, dim=0)
+        final_boxes = torch.cat(final_boxes_list, dim=0)
+
+        hint_points = None
+        if args.hint_centers_jsonl is not None:
+            final_masks, final_scores, final_boxes = merge_adjacent_masks(
+                final_masks, final_scores, final_boxes, args.merge_gap_px
+            )
+            hint_points = hint_centers.get(img_path.name)
+            if hint_points is None:
+                hint_points = hint_centers.get(img_path.stem)
+
+            if not hint_points:
+                print(f"[hint] {img_path.name}: no hint points, writing empty mask")
+                if args.write_empty:
+                    save_empty_mask_like_image(image, mask_path)
+                    if args.overlay_dir:
+                        overlay_filename = f"{img_path.stem}.jpg"
+                        overlay_path = args.overlay_dir / overlay_filename
+                        image.save(overlay_path)
+                else:
+                    print(f"[skip] {img_path.name}: empty mask writing disabled")
+
+                if args.write_summary:
+                    summary.append(
+                        {
+                            "source_image": str(img_path),
+                            "mask": mask_filename,
+                            "instances": 0,
+                            "scores": [],
+                            "boxes_xyxy": [],
+                            "empty": True,
+                        }
+                    )
+                continue
+            else:
+                final_masks, final_scores, final_boxes = select_masks_by_hints(
+                    final_masks, final_scores, final_boxes, hint_points
+                )
+                print(
+                    f"[hint] {img_path.name}: "
+                    f"kept {final_masks.shape[0]} masks for {len(hint_points)} hints"
+                )
+
+        if final_masks.shape[0] == 0:
+            print(f"[empty] {img_path.name}: no masks after hint filtering")
+            if args.write_empty:
+                save_empty_mask_like_image(image, mask_path)
+                if args.overlay_dir:
+                    overlay_filename = f"{img_path.stem}.jpg"
+                    overlay_path = args.overlay_dir / overlay_filename
+                    image.save(overlay_path)
+            else:
+                print(f"[skip] {img_path.name}: empty mask writing disabled")
+
+            if args.write_summary:
+                summary.append(
+                    {
+                        "source_image": str(img_path),
+                        "mask": mask_filename,
+                        "instances": 0,
+                        "scores": [],
+                        "boxes_xyxy": [],
+                        "empty": True,
+                    }
+                )
+            continue
+
+        # 1. Save Mask
+        save_instance_mask(final_masks, final_scores, mask_path)
+
+        # 2. Save Overlay (if requested)
+        if args.overlay_dir:
+            overlay_filename = f"{img_path.stem}.jpg"
+            overlay_path = args.overlay_dir / overlay_filename
+            save_overlay(image, final_masks, overlay_path)
+
+        # 3. Update Summary
+        if args.write_summary:
+            summary.append(
+                {
+                    "source_image": str(img_path),
+                    "mask": mask_filename,
+                    "instances": int(final_masks.shape[0]),
+                    "scores": [float(x.cpu()) for x in final_scores],
+                    "boxes_xyxy": [[float(x) for x in b.cpu()] for b in final_boxes],
+                    "empty": False,
+                }
+            )
+
+        print(f"[done] {img_path.name}: wrote {final_masks.shape[0]} instances (Prompts: {args.prompt})")
+    
+    # Write summary JSON if requested
+    if args.write_summary:
+        summary_path = args.output_dir / "summary.json"
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Finished. Summary written to {summary_path}")
+    else:
+        print("Finished.")
+
+
+if __name__ == "__main__":
+    main()
