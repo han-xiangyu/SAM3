@@ -1,6 +1,6 @@
 #!/bin/bash
 
-input_dir=/home/xiangyu/Downloads/MCM_logs/scanmatch_viewer_log/processed_outputs_objects/images/image_lucid_fc_jpeg
+input_dir=/home/xiangyu/Downloads/MCM_logs/scanmatch_viewer_log/processed_outputs_front_cam_streaming_v4/images/image_lucid_fl_jpeg
 
 python scripts/batch_segment_images_with_hints.py \
     --input-dir $input_dir \
@@ -16,7 +16,7 @@ python scripts/batch_segment_images_with_hints.py \
     --device cuda \
     --write-empty \
     --confidence 0.4 \
-    --hint-centers-jsonl /home/xiangyu/Downloads/MCM_logs/scanmatch_viewer_log/processed_outputs_objects/keyframes_object_centers.jsonl \
+    --hint-centers-jsonl /home/xiangyu/Downloads/MCM_logs/scanmatch_viewer_log/processed_outputs_front_cam_streaming_v4/keyframes_object_centers.jsonl \
     --overlay-dir $input_dir/dynamic_overlays
 
 
