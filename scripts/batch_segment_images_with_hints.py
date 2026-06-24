@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -108,126 +107,44 @@ def load_hint_centers(path: Path) -> Dict[str, List[Tuple[float, float]]]:
     return hints
 
 
-def mask_centroids_xy(masks: torch.Tensor) -> np.ndarray:
-    """Compute per-mask centroids as (x, y) coordinates."""
-    if masks.ndim != 4:
-        raise ValueError(f"Expected masks with shape [N,1,H,W], got {masks.shape}")
-
-    centers = []
-    for idx in range(masks.shape[0]):
-        mask = masks[idx].squeeze().cpu().numpy()
-        coords = np.argwhere(mask > 0)
-        if coords.size == 0:
-            centers.append((np.nan, np.nan))
-            continue
-        y_mean, x_mean = coords.mean(axis=0)
-        centers.append((float(x_mean), float(y_mean)))
-    return np.array(centers, dtype=np.float32)
-
-
 def select_masks_by_hints(
     masks: torch.Tensor,
     scores: torch.Tensor,
     boxes: torch.Tensor,
     hint_points: List[Tuple[float, float]],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select masks by closest hint points, allowing duplicate selections."""
-    if not hint_points:
-        empty = masks[:0]
-        return empty, scores[:0], boxes[:0]
+    """Keep only the instances whose mask contains a hint pixel.
 
-    centers = mask_centroids_xy(masks)
-    if centers.size == 0:
-        empty = masks[:0]
-        return empty, scores[:0], boxes[:0]
+    Each hint links solely to the instance it lands inside; hints that fall on no
+    mask are dropped (no proximity/nearest fallback). When several masks overlap a
+    hint pixel, the highest-scoring one is kept.
+    """
+    empty = (masks[:0], scores[:0], boxes[:0])
+    if not hint_points or masks.shape[0] == 0:
+        return empty
 
-    hints_arr = np.array(hint_points, dtype=np.float32)
-    distances = (
-        (hints_arr[:, None, 0] - centers[None, :, 0]) ** 2
-        + (hints_arr[:, None, 1] - centers[None, :, 1]) ** 2
-    )
-    distances = np.where(np.isnan(distances), np.inf, distances)
-    nearest = np.argmin(distances, axis=1).tolist()
+    masks_bool = masks.squeeze(1).bool()  # [N, H, W]
+    height, width = masks_bool.shape[1], masks_bool.shape[2]
 
-    idx = torch.tensor(nearest, dtype=torch.long, device=masks.device)
+    selected: List[int] = []
+    seen: set = set()
+    for x, y in hint_points:
+        col = int(round(x))
+        row = int(round(y))
+        if not (0 <= row < height and 0 <= col < width):
+            continue
+        covering = torch.nonzero(masks_bool[:, row, col], as_tuple=False).flatten()
+        if covering.numel() == 0:
+            continue
+        best = int(covering[torch.argmax(scores[covering])].item())
+        if best not in seen:
+            seen.add(best)
+            selected.append(best)
+
+    if not selected:
+        return empty
+    idx = torch.tensor(selected, dtype=torch.long, device=masks.device)
     return masks.index_select(0, idx), scores.index_select(0, idx), boxes.index_select(0, idx)
-
-
-def merge_adjacent_masks(
-    masks: torch.Tensor,
-    scores: torch.Tensor,
-    boxes: torch.Tensor,
-    gap_px: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Merge masks that are within a pixel gap of each other."""
-    if masks.ndim != 4:
-        raise ValueError(f"Expected masks with shape [N,1,H,W], got {masks.shape}")
-    if masks.shape[0] <= 1:
-        return masks, scores, boxes
-
-    masks_bool = masks.squeeze(1).bool()
-    padding = int(max(gap_px, 0))
-    kernel = 2 * padding + 1
-    if kernel > 1:
-        dilated = F.max_pool2d(
-            masks_bool.float().unsqueeze(1),
-            kernel_size=kernel,
-            stride=1,
-            padding=padding,
-        ).squeeze(1).bool()
-    else:
-        dilated = masks_bool
-
-    num_masks = masks_bool.shape[0]
-    parent = list(range(num_masks))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        ra = find(a)
-        rb = find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(num_masks):
-        for j in range(i + 1, num_masks):
-            if (dilated[i] & masks_bool[j]).any():
-                union(i, j)
-
-    groups: Dict[int, List[int]] = {}
-    for idx in range(num_masks):
-        root = find(idx)
-        groups.setdefault(root, []).append(idx)
-
-    merged_masks = []
-    merged_scores = []
-    merged_boxes = []
-
-    for indices in groups.values():
-        group_mask = masks_bool[indices].any(dim=0)
-        merged_masks.append(group_mask)
-        merged_scores.append(scores[indices].max())
-
-        coords = torch.nonzero(group_mask, as_tuple=False)
-        if coords.numel() == 0:
-            merged_boxes.append(torch.tensor([0, 0, 0, 0], device=masks.device))
-        else:
-            y_min = coords[:, 0].min()
-            x_min = coords[:, 1].min()
-            y_max = coords[:, 0].max()
-            x_max = coords[:, 1].max()
-            merged_boxes.append(
-                torch.stack([x_min, y_min, x_max, y_max]).to(masks.device)
-            )
-
-    merged_masks_t = torch.stack(merged_masks, dim=0).unsqueeze(1).to(masks.device)
-    merged_scores_t = torch.stack(merged_scores, dim=0).to(masks.device)
-    merged_boxes_t = torch.stack(merged_boxes, dim=0).to(masks.device)
-    return merged_masks_t, merged_scores_t, merged_boxes_t
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,13 +225,6 @@ def parse_args() -> argparse.Namespace:
             '{"image": "<name>", "centers": [[cx, cy], ...]}'
         ),
     )
-    parser.add_argument(
-        "--merge-gap-px",
-        type=int,
-        default=5,
-        help="Pixel gap tolerance to merge adjacent masks before hint matching.",
-    )
-
     return parser.parse_args()
 
 
@@ -408,9 +318,6 @@ def main() -> None:
 
         hint_points = None
         if args.hint_centers_jsonl is not None:
-            final_masks, final_scores, final_boxes = merge_adjacent_masks(
-                final_masks, final_scores, final_boxes, args.merge_gap_px
-            )
             hint_points = hint_centers.get(img_path.name)
             if hint_points is None:
                 hint_points = hint_centers.get(img_path.stem)
