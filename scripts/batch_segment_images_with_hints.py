@@ -7,7 +7,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import numpy as np
@@ -107,17 +107,57 @@ def load_hint_centers(path: Path) -> Dict[str, List[Tuple[float, float]]]:
     return hints
 
 
+def mask_pixel_coords(masks_bool: torch.Tensor) -> List[torch.Tensor]:
+    """Foreground pixel coordinates (row, col) for each mask as a list of [P_i, 2] tensors."""
+    return [torch.nonzero(masks_bool[i], as_tuple=False) for i in range(masks_bool.shape[0])]
+
+
+def nearest_pixel_index(
+    mask_coords: Sequence[torch.Tensor],
+    point_row: float,
+    point_col: float,
+    scores: torch.Tensor,
+) -> Optional[int]:
+    """Index of the mask whose nearest foreground pixel is closest to (point_row, point_col).
+
+    Empty masks are ignored. Distance ties are broken by higher score.
+    Returns None when every mask is empty.
+    """
+    if not mask_coords:
+        return None
+    point = torch.tensor(
+        [point_row, point_col], device=mask_coords[0].device, dtype=torch.float32
+    )
+    best_idx: Optional[int] = None
+    best_dist2: Optional[float] = None
+    best_score: Optional[float] = None
+    for i, coords in enumerate(mask_coords):
+        if coords.shape[0] == 0:
+            continue
+        dist2 = ((coords.float() - point) ** 2).sum(dim=1).min().item()
+        score = float(scores[i])
+        if (
+            best_idx is None
+            or dist2 < best_dist2
+            or (dist2 == best_dist2 and score > best_score)
+        ):
+            best_idx, best_dist2, best_score = i, dist2, score
+    return best_idx
+
+
 def select_masks_by_hints(
     masks: torch.Tensor,
     scores: torch.Tensor,
     boxes: torch.Tensor,
     hint_points: List[Tuple[float, float]],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Keep only the instances whose mask contains a hint pixel.
+    """Map each hint point to one instance.
 
-    Each hint links solely to the instance it lands inside; hints that fall on no
-    mask are dropped (no proximity/nearest fallback). When several masks overlap a
-    hint pixel, the highest-scoring one is kept.
+    A hint first links to a mask that covers its pixel; when several masks overlap
+    the pixel, the highest-scoring one is kept. If no mask covers the pixel, the
+    hint falls back to the instance whose nearest foreground pixel is closest to
+    the hint point. Each instance is kept at most once; hints whose rounded pixel
+    lies outside the image are dropped.
     """
     empty = (masks[:0], scores[:0], boxes[:0])
     if not hint_points or masks.shape[0] == 0:
@@ -125,6 +165,8 @@ def select_masks_by_hints(
 
     masks_bool = masks.squeeze(1).bool()  # [N, H, W]
     height, width = masks_bool.shape[1], masks_bool.shape[2]
+
+    mask_coords: Optional[List[torch.Tensor]] = None
 
     selected: List[int] = []
     seen: set = set()
@@ -134,9 +176,14 @@ def select_masks_by_hints(
         if not (0 <= row < height and 0 <= col < width):
             continue
         covering = torch.nonzero(masks_bool[:, row, col], as_tuple=False).flatten()
-        if covering.numel() == 0:
-            continue
-        best = int(covering[torch.argmax(scores[covering])].item())
+        if covering.numel() > 0:
+            best: Optional[int] = int(covering[torch.argmax(scores[covering])].item())
+        else:
+            if mask_coords is None:
+                mask_coords = mask_pixel_coords(masks_bool)
+            best = nearest_pixel_index(mask_coords, row, col, scores)
+            if best is None:
+                continue
         if best not in seen:
             seen.add(best)
             selected.append(best)
